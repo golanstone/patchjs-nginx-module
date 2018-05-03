@@ -266,6 +266,11 @@ static ngx_int_t ngx_http_patchjs_handler(ngx_http_request_t *r)
         count++;
         p--;
     }
+
+    // basic check url format
+    if (new_version.len != old_version.len || ngx_strncmp(new_version.data, old_version.data, new_version.len) <= 0) {
+        return NGX_DECLINED;
+    }
     
     ngx_open_file_info_t of;
     ngx_memzero(&of, sizeof(ngx_open_file_info_t));
