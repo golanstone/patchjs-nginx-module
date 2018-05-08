@@ -1,15 +1,15 @@
 #include <ngx_md5.h>
-#include "hash_table.h"
 #include "ngx_diff.h"
+#include "hashmap.h"
 
 #define CHUNK_SIZE 20
-#define MAX_CONTENT_SIZE (2*1024*1024)
+#define MD5_CONTENT_SIZE 16
 
 ngx_pool_t *g_pool = NULL;
 
-static void checksum(ngx_http_request_t *r, HashTable *ht, u_char* file_cnt, ngx_uint_t len);
-static ngx_uint_t roll(HashTable *ht, ngx_array_t *diff_array, u_char* file_cnt, ngx_uint_t len);
-static ngx_int_t find_match_order_id(HashTable *ht, u_char *md5_result, ngx_uint_t last_order_id);
+static void checksum(ngx_http_request_t *r, map_t ht, u_char* file_cnt, ngx_uint_t len);
+static ngx_uint_t roll(map_t ht, ngx_array_t *diff_array, u_char* file_cnt, ngx_uint_t len);
+static ngx_int_t find_match_order_id(map_t ht, u_char *md5_result, ngx_uint_t last_order_id);
 static u_char* make_md5(const u_char* cnt, ngx_uint_t len, u_char *result);
 
 typedef struct diff_data{
@@ -20,15 +20,13 @@ typedef struct diff_data{
 } DiffData;
 
 typedef struct result {
-	struct HashTable *ht_dst;
-	struct HashTable *ht_src;
+	map_t ht_dst;
 
 	ngx_pool_t *pool;
 	ngx_array_t *diff_array;
 } Result;
 
-ngx_str_t * calc_diff_data(ngx_http_request_t *r, u_char* src_file_cnt, ngx_uint_t src_len, u_char* dst_file_cnt, ngx_uint_t dst_len)
-{
+ngx_str_t * calc_diff_data(ngx_http_request_t *r, u_char* src_file_cnt, ngx_uint_t src_len, u_char* dst_file_cnt, ngx_uint_t dst_len) {
 	ngx_str_t *res = (ngx_str_t *)ngx_palloc(r->pool, sizeof(ngx_str_t));
 	u_char prefix[32] = {0};
 	ngx_str_t tail = ngx_string("]}");
@@ -38,8 +36,7 @@ ngx_str_t * calc_diff_data(ngx_http_request_t *r, u_char* src_file_cnt, ngx_uint
 	ngx_pool_t *pool = r->pool;
 	result->pool = pool;
 
-	result->ht_dst = hash_table_new(pool, dst_len/CHUNK_SIZE+1);
-	result->ht_src = hash_table_new(pool, src_len/CHUNK_SIZE+1);
+	result->ht_dst = hashmap_new(pool, MD5_CONTENT_SIZE);
 
 	ngx_memzero(prefix, sizeof(prefix));
 	u_char src_md5[17], dst_md5[17];
@@ -139,13 +136,13 @@ ngx_str_t * calc_diff_data(ngx_http_request_t *r, u_char* src_file_cnt, ngx_uint
 	/* tail */
 	ngx_memcpy(p_content, tail.data, tail.len);
 	p_content += tail.len;
+	res->len = p_content - res->data;
 
 	return res;
 }
 
 /* calc md5 */ 
-static u_char* make_md5(const u_char* cnt, ngx_uint_t len, u_char *result) 
-{
+static u_char* make_md5(const u_char* cnt, ngx_uint_t len, u_char *result) {
 	ngx_md5_t ctx;
 	ngx_md5_init(&ctx);
 	ngx_md5_update(&ctx, cnt, len);
@@ -153,8 +150,7 @@ static u_char* make_md5(const u_char* cnt, ngx_uint_t len, u_char *result)
 	return result;
 }
 
-static void checksum(ngx_http_request_t *r, struct HashTable *ht, u_char* file_cnt, ngx_uint_t len)
-{
+static void checksum(ngx_http_request_t *r, map_t ht, u_char* file_cnt, ngx_uint_t len) {
 	ngx_pool_t *pool = r->pool;
 	u_char *p = file_cnt;
 	ngx_uint_t order_id = 0;
@@ -162,20 +158,23 @@ static void checksum(ngx_http_request_t *r, struct HashTable *ht, u_char* file_c
 		ngx_uint_t get_size = CHUNK_SIZE;
 		ngx_array_t *order_ids = NULL;
 		ngx_uint_t *p_order_id = NULL;
+		int ret = -1;
 
 		if (len - i < CHUNK_SIZE) {
 			get_size = len - i;
 		}	
 
-		u_char md5_value[17] = {0};
-		ngx_memzero(md5_value, sizeof(md5_value));
+		u_char *md5_value = ngx_palloc(pool, MD5_CONTENT_SIZE+1);
+		ngx_memzero(md5_value, MD5_CONTENT_SIZE+1);
 		make_md5(p, get_size, md5_value);
-		order_ids = (ngx_array_t *)hash_table_get(ht, (char *)md5_value);
-		if (order_ids == NULL) {
+
+		ret = hashmap_get(ht, (char*)md5_value, MD5_CONTENT_SIZE, (void**)(&order_ids));
+		if (ret == MAP_MISSING) {
 			order_ids = ngx_array_create(pool, 4, sizeof(ngx_uint_t));
 			p_order_id = ngx_array_push(order_ids); 
 			*p_order_id = order_id++;
-			hash_table_put(ht, (char *)md5_value, order_ids);
+
+			hashmap_put(ht, (char *)md5_value, MD5_CONTENT_SIZE, order_ids);
 		} else {
 			p_order_id = ngx_array_push(order_ids); 
 			*p_order_id = order_id++;
@@ -186,9 +185,7 @@ static void checksum(ngx_http_request_t *r, struct HashTable *ht, u_char* file_c
 	}
 }
 
-static ngx_uint_t roll(HashTable *ht, ngx_array_t *diff_array, u_char* file_cnt, ngx_uint_t len)
-{
-	ngx_uint_t new_content_size = 0;
+static ngx_uint_t roll(map_t ht, ngx_array_t *diff_array, u_char* file_cnt, ngx_uint_t len) {
 	u_char *p = file_cnt; /* local file */
 
 	u_char *unmatch_start = file_cnt; /* point unmatch addr */
@@ -207,7 +204,8 @@ static ngx_uint_t roll(HashTable *ht, ngx_array_t *diff_array, u_char* file_cnt,
 			is_last = true;
 		}
 
-		u_char md5_result[17] = {0};
+		u_char md5_result[MD5_CONTENT_SIZE+1] = {0};
+		ngx_memzero(md5_result, MD5_CONTENT_SIZE+1);
 		ngx_int_t match_order_id = -1;
 		if (!is_last) {
 			make_md5(p, get_size, md5_result);
@@ -225,8 +223,6 @@ static ngx_uint_t roll(HashTable *ht, ngx_array_t *diff_array, u_char* file_cnt,
 				unmatch_diff->order_id = -1;
 				unmatch_diff->start = unmatch_start;
 				unmatch_diff->len = unmatch_len;
-				
-				new_content_size += unmatch_len + 3;
 			}
 
 			match_diff = ngx_array_push(diff_array); 
@@ -234,8 +230,6 @@ static ngx_uint_t roll(HashTable *ht, ngx_array_t *diff_array, u_char* file_cnt,
 			match_diff->order_id = match_order_id;
 			match_diff->start = NULL;
 			match_diff->len = 0;
-
-			new_content_size += 10;
 
 			p += get_size;
 			i += get_size;
@@ -252,8 +246,6 @@ static ngx_uint_t roll(HashTable *ht, ngx_array_t *diff_array, u_char* file_cnt,
 				unmatch_diff->order_id = -1;
 				unmatch_diff->start = unmatch_start;
 				unmatch_diff->len = unmatch_len;
-
-				new_content_size += unmatch_len + 3;
 			}
 		}
 	}
@@ -261,10 +253,11 @@ static ngx_uint_t roll(HashTable *ht, ngx_array_t *diff_array, u_char* file_cnt,
 	return 0;
 }
 
-static ngx_int_t find_match_order_id(HashTable *ht, u_char *md5_result, ngx_uint_t last_order_id)
+static ngx_int_t find_match_order_id(map_t ht, u_char *md5_result, ngx_uint_t last_order_id)
 {
-	ngx_array_t *value = (ngx_array_t*)hash_table_get(ht, (char *)md5_result);
-	if (value == NULL) {
+	ngx_array_t *value = NULL; 
+	int ret = hashmap_get(ht, (char *)md5_result, MD5_CONTENT_SIZE, (void**)(&value));
+	if (ret == MAP_MISSING) {
 		return -1;
 	}
 
